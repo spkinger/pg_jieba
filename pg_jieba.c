@@ -11,15 +11,30 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
+/* 系统标准头文件 */
+#include <signal.h>      /* 用于 SIGHUP 信号处理 */
+#include <limits.h>      /* 用于 UINT32_MAX */
+#include <sys/types.h>   /* 用于 kill() */
 
-#include "lib/stringinfo.h"
-#include "utils/guc.h"
-#include "utils/elog.h"
-#include "utils/varlena.h"
-#include "miscadmin.h"
-#include "tsearch/ts_public.h"
+/* PostgreSQL 核心头文件 */
+#include "postgres.h"    /* PostgreSQL 核心头文件 */
+#include "miscadmin.h"   /* 用于 PostmasterPid */
+#include "fmgr.h"       /* 用于 PG_MODULE_MAGIC */
 
+/* PostgreSQL 存储相关头文件 */
+#include "storage/ipc.h"        /* 用于共享内存操作 */
+#include "storage/shmem.h"      /* 用于共享内存操作 */
+#include "storage/lwlock.h"     /* 用于轻量级锁 */
+
+/* PostgreSQL 工具类头文件 */
+#include "lib/stringinfo.h"     /* 用于字符串处理 */
+#include "utils/guc.h"          /* 用于GUC变量 */
+#include "utils/elog.h"         /* 用于日志记录 */
+#include "tsearch/ts_public.h"  /* 用于全文检索 */
+#include "libpq/auth.h"         /* 用于 ClientAuthentication_hook */
+#include "utils/varlena.h"      /* 用于 varlena 类型 */
+
+/* 项目自定义头文件 */
 #include "jieba.h"
 
 PG_MODULE_MAGIC;
@@ -38,6 +53,22 @@ typedef struct
 	ParStat    *stat;
 } ParserState;
 
+/* 共享内存存储字典版本号 */
+typedef struct
+{
+    LWLock *lock;
+    uint32 global_version;
+} SharedDictionaryState;
+
+/* SharedDictionaryState占用共享内存大小计算函数 */
+static Size pg_jieba_shmem_size(void);
+
+/* 保存之前钩子的变量，共享内存相关 */
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+static void init_shared_memory(void);
+static void pg_jieba_shmem_request(void);
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -73,10 +104,24 @@ Datum jieba_reload_dict(PG_FUNCTION_ARGS);
 #define DICT_EXT "dict"
 #define MODEL_EXT "model"
 
-static void DefineCustomConfigVariables();
+static void DefineCustomConfigVariables(void);
 static void recompute_dicts_path(void);
 static char* extract_dict_list(const char *dictsString);
 static char* jieba_get_tsearch_config_filename(const char *basename, const char *extension);
+/* 添加信号处理函数声明 */
+static void pg_jieba_sighup_handler(SIGNAL_ARGS);
+/* 保存之前的 SIGHUP 处理函数 */
+static void (*prev_sighup_handler) (SIGNAL_ARGS) = NULL;
+/* 添加信号处理函数声明 */
+static void pg_jieba_backend_sighup_handler(SIGNAL_ARGS);
+/* 保存之前的 SIGHUP 处理函数 */
+static void (*prev_sighup_handler_backend) (SIGNAL_ARGS) = NULL;
+/* 保存原始的 ClientAuthentication_hook */
+static ClientAuthentication_hook_type prev_ClientAuthentication = NULL;
+/* 登录成功后注册信号处理器 */
+static void jieba_client_authentication(Port *port, int status);
+/* 检测刷新字典 */
+static void check_and_refresh_dictionary(void);
 
 static JiebaCtx* jieba = NULL;
 
@@ -93,6 +138,10 @@ static bool userDictsValid = true;
 
 static bool check_user_dict(char **newval, void **extra, GucSource source);
 static void assign_user_dict(const char *newval, void *extra);
+
+
+static SharedDictionaryState *shared_state = NULL;
+static uint32 local_version = 0; /* 每个进程的本地版本号 */
 
 
 /*
@@ -112,6 +161,19 @@ _PG_init(void)
 		DefineCustomConfigVariables();
 	}
 
+	/* 保存之前的钩子并设置新的钩子 */
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = pg_jieba_shmem_request;
+	
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = init_shared_memory;
+
+	/* 替换 ClientAuthentication_hook */
+	prev_ClientAuthentication = ClientAuthentication_hook;
+	ClientAuthentication_hook = jieba_client_authentication;
+
+	prev_sighup_handler = pqsignal(SIGHUP, pg_jieba_sighup_handler);
+
 	userDictsValid = false;
 	recompute_dicts_path();
 }
@@ -126,6 +188,37 @@ _PG_fini(void)
 		Jieba_Free(jieba);
 		jieba = NULL;
 	}
+}
+
+/*
+ * 初始化共享内存
+ */
+void
+init_shared_memory(void)
+{
+	bool found;
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	/* 分配共享内存 */
+	shared_state = ShmemInitStruct("SharedDictionaryState",
+								  sizeof(SharedDictionaryState),
+								  &found);
+
+	if (!found)
+	{
+		/* 首次初始化 */
+		shared_state->lock = &(GetNamedLWLockTranche("pg_jieba_shared_lock"))->lock;
+		shared_state->global_version = 0;
+	}
+
+	LWLockRelease(AddinShmemInitLock);
+
+	elog(LOG, "pg_jieba: Shared dictionary state initialized");
+
+	/* 调用之前的钩子（如果存在） */
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
 }
 
 /*
@@ -249,8 +342,23 @@ jieba_lextype(PG_FUNCTION_ARGS)
 Datum
 jieba_reload_dict(PG_FUNCTION_ARGS)
 {
-    userDictsValid = false;
-    recompute_dicts_path();
+	/* 更新全局版本号 */
+    LWLockAcquire(shared_state->lock, LW_EXCLUSIVE);
+	if (shared_state->global_version == UINT32_MAX) {
+        shared_state->global_version = 1;
+    } else {
+        shared_state->global_version++;
+    }
+    LWLockRelease(shared_state->lock);
+
+	/* 发送 SIGHUP 信号给 Postmaster，用于通知刷新字典 */
+    if (kill(PostmasterPid, SIGHUP))
+    {
+        ereport(WARNING, (errmsg("pg_jieba: failed to send SIGHUP signal to postmaster: %m")));
+    } else {
+        ereport(LOG, (errmsg("pg_jieba: SIGHUP signal sent to postmaster for reload dictionary")));
+    }
+
 	PG_RETURN_VOID();
 }
 
@@ -475,4 +583,113 @@ extract_dict_list(const char *dictsString)
 	pfree(rawstring);
 
 	return buf->data;
+}
+
+/*
+ * 检测并刷新字典
+ */
+void check_and_refresh_dictionary(void)
+{
+    uint32 global_version;
+
+    /* 获取全局版本号 */
+    LWLockAcquire(shared_state->lock, LW_SHARED);
+    global_version = shared_state->global_version;
+    LWLockRelease(shared_state->lock);
+
+    /* 如果版本号更新，刷新字典 */
+    if (global_version != local_version)
+    {
+        elog(LOG, "pg_jieba: local-version=%u, global-version=%u, refresh dictionary...",
+             local_version, global_version);
+
+        userDictsValid = false;
+   		recompute_dicts_path();
+        local_version = global_version;
+		elog(LOG, "pg_jieba: Dictionary refresh finished ~");
+    }
+}
+
+/*
+ * 计算SharedDictionaryState占用共享内存大小
+ */
+static Size
+pg_jieba_shmem_size(void)
+{
+	Size size = 0;
+	
+	size = add_size(size, sizeof(SharedDictionaryState));
+	return size;
+}
+
+/*
+ * 添加共享内存请求函数
+ */
+static void
+pg_jieba_shmem_request(void)
+{
+    /* 如果有之前的钩子，先调用 */
+    if (prev_shmem_request_hook)
+        prev_shmem_request_hook();
+        
+    /* 请求共享内存和LWLock */
+    RequestAddinShmemSpace(pg_jieba_shmem_size());
+    RequestNamedLWLockTranche("pg_jieba_shared_lock", 1);
+}
+
+/*
+ * postmaster 的 SIGHUP 信号处理函数，pg_reload_conf()执行时会触发
+ */
+static void
+pg_jieba_sighup_handler(SIGNAL_ARGS)
+{
+    /* 首先调用之前的处理函数（如果有的话） */
+    if (prev_sighup_handler)
+        prev_sighup_handler(postgres_signal_arg);
+
+    elog(LOG, "pg_jieba: Postmaster received SIGHUP signal !!!");
+    
+    /* 检测并刷新字典 */
+    if (shared_state != NULL)
+    {
+        check_and_refresh_dictionary();
+    }
+}
+
+/*
+ * backend process 的 SIGHUP 信号处理函数，pg_reload_conf()执行时会触发
+ */
+static void
+pg_jieba_backend_sighup_handler(SIGNAL_ARGS)
+{
+    /* 首先调用之前的处理函数（如果有的话） */
+    if (prev_sighup_handler_backend)
+        prev_sighup_handler_backend(postgres_signal_arg);
+
+    elog(LOG, "pg_jieba: Backend received SIGHUP signal !!!");
+    
+    /* 检测并刷新字典 */
+    if (shared_state != NULL)
+    {
+        check_and_refresh_dictionary();
+    }
+}
+
+/* 
+ * 自定义的 ClientAuthentication 钩子函数
+ * 登录成功才注册信号处理器
+ */
+static void
+jieba_client_authentication(Port *port, int status)
+{
+    /* 登录成功才注册信号处理器 */
+    if (status == STATUS_OK)
+    {
+        elog(LOG, "pg_jieba: Registering backend SIGHUP handler");
+        prev_sighup_handler_backend = pqsignal(SIGHUP, pg_jieba_backend_sighup_handler);
+    }
+
+    /* 调用原始的 ClientAuthentication_hook（如果存在） */
+    if (prev_ClientAuthentication)
+        prev_ClientAuthentication(port, status);
 }

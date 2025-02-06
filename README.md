@@ -5,7 +5,9 @@
 [![Extension](https://img.shields.io/badge/PostgreSQL_10.x-Extension-green.svg)]()
 [![Extension](https://img.shields.io/badge/PostgreSQL_11.x-Extension-green.svg)]()
 
-pg_jieba is a PostgreSQL extension for full-text search of Chinese.  
+pg_jieba is a PostgreSQL extension for full-text search of Chinese. 
+It is a fork of [pg_jieba](https://github.com/jaiminpan/pg_jieba) with some improvements.
+Dictionary reloading no longer requires a restart, just execute `select pg_reload_conf();`.
 
 ## NOTE
 It is tested on [![Extension](https://img.shields.io/badge/PostgreSQL9.6.3-CentOS_7-green.svg)]() [![Extension](https://img.shields.io/badge/PostgreSQL11.1-MacOS_Mojave-green.svg)]()  
@@ -32,6 +34,17 @@ Install Postgres:
 * Option:  
   Download From http://www.enterprisedb.com/products-services-training/pgdownload
 
+* Option:
+  Debian:
+  ```
+  # for pg15
+  sudo apt-get install make gcc postgresql-server-dev-15 g++ git cmake libpq5=15.10-1.pgdg110+1 libpq-dev=15.10-1.pgdg110+1 libkrb5-dev
+  ```
+
+  ```
+  # if libpq5=15.10-1.pgdg110+1 is not exist, you can search it.
+  apt list -a libpq5
+  ```
 
 INSTALL
 -------
