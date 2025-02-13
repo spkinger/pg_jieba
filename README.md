@@ -8,6 +8,8 @@
 pg_jieba is a PostgreSQL extension for full-text search of Chinese. 
 It is a fork of [pg_jieba](https://github.com/jaiminpan/pg_jieba) with some improvements.
 Dictionary reloading no longer requires a restart, just execute `select pg_reload_conf();`.
+Support loading dictionary from table.
+
 
 ## NOTE
 It is tested on [![Extension](https://img.shields.io/badge/PostgreSQL9.6.3-CentOS_7-green.svg)]() [![Extension](https://img.shields.io/badge/PostgreSQL11.1-MacOS_Mojave-green.svg)]()  
@@ -250,6 +252,27 @@ There is [docker file] by @ssfdust.
 # scripts
 docker run --name testjieba -e POSTGRES_PASSWORD=passwd -e POSTGRES_USER=test -e POSTGRES_DB=testdb -d ssfdust/psql_jieba_swsc
 docker exec -ti testjieba psql -U test testdb
+```
+
+## Loading dictionary from table
+
+```sql
+-- example
+create table test_dict (
+    word   text,
+    weight integer,
+    tag    text
+);
+
+insert into test_dict (word, weight, tag) values ('测试', 100, 'nz');
+insert into test_dict (word, tag) values ('测试', 'nz');
+insert into test_dict (word) values ('测试');
+
+-- add dictionary, and auto reload dictionary
+select jieba_dict_add_table('test_dict');
+
+-- remove dictionary, and auto reload dictionary
+select jieba_dict_remove_table('test_dict');
 ```
 
 ## THANKS
