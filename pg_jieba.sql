@@ -38,6 +38,16 @@ RETURNS void
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
+CREATE FUNCTION jieba_dict_add_table(text)
+RETURNS text
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION jieba_dict_remove_table(text)
+RETURNS text
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
 CREATE TEXT SEARCH PARSER jieba (
 	START    = jieba_start,
 	GETTOKEN = jieba_gettoken,
