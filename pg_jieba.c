@@ -1051,17 +1051,36 @@ pg_jieba_shmem_request(void)
 static void
 pg_jieba_sighup_handler(SIGNAL_ARGS)
 {
-    /* 首先调用之前的处理函数（如果有的话） */
-    if (prev_sighup_handler)
-        prev_sighup_handler(postgres_signal_arg);
+	ErrorData  *edata;
 
-    elog(LOG, "pg_jieba: Postmaster received SIGHUP signal !!!");
-    
-    /* 检测并刷新字典 */
-    if (shared_state != NULL)
+    PG_TRY();
     {
-        check_and_refresh_dictionary();
+        if (prev_sighup_handler)
+            prev_sighup_handler(postgres_signal_arg);
+
+        elog(LOG, "pg_jieba: Postmaster received SIGHUP signal !!!");
+        
+        if (shared_state != NULL)
+        {
+            check_and_refresh_dictionary();
+        }
     }
+    PG_CATCH();
+    {
+         /* 获取错误信息 */
+        edata = CopyErrorData();
+        
+        /* 记录详细的错误信息 */
+        elog(LOG, "pg_jieba: Error in SIGHUP handler: %s (Error Code: %d, File: %s, Line: %d)", 
+             edata->message,
+             edata->sqlerrcode,
+             edata->filename,
+             edata->lineno);
+             
+        FreeErrorData(edata);
+        FlushErrorState();
+    }
+    PG_END_TRY();
 }
 
 /*
