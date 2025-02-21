@@ -16,6 +16,7 @@
 #include <limits.h>      /* 用于 UINT32_MAX */
 #include <sys/types.h>   /* 用于 kill() */
 #include <unistd.h>      /* 添加此行以声明 unlink 函数 */
+#include <sys/stat.h>    /* 添加此行以声明 chmod 函数 */
 
 /* PostgreSQL 核心头文件 */
 #include "postgres.h"    /* PostgreSQL 核心头文件 */
@@ -60,7 +61,7 @@ typedef struct
 typedef struct
 {
     LWLock *lock;
-    uint32 global_version;
+    uint32_t global_version;
 } SharedDictionaryState;
 
 /* SharedDictionaryState占用共享内存大小计算函数 */
@@ -130,12 +131,16 @@ static void (*prev_sighup_handler_backend) (SIGNAL_ARGS) = NULL;
 static ClientAuthentication_hook_type prev_ClientAuthentication = NULL;
 /* 登录成功后注册信号处理器 */
 static void jieba_client_authentication(Port *port, int status);
-/* 检测刷新字典 */
-static void check_and_refresh_dictionary(void);
+/* 执行刷新字典 */
+static void jieba_refresh_dictionary(uint32_t global_version);
 /* 更新字典版本号，并通知Postmaster刷新字典 */
 static void jieba_reload_dict_common(void);
 /* 修改参数：pg_jieba.data_path_user_dict */
 static void edit_data_path_user_dict(const char *conf_val);
+/* 读取 jieba.conf 中的配置 */
+static char* read_data_path_user_dict(void);
+/* 发送 SIGHUP 信号给所有 backend 进程 */
+static void send_sighup_to_all_backends(void);
 
 static JiebaCtx* jieba = NULL;
 
@@ -158,7 +163,7 @@ static bool check_data_path_user_dict(char **newval, void **extra, GucSource sou
 static void assign_data_path_user_dict(const char *newval, void *extra);
 
 static SharedDictionaryState *shared_state = NULL;
-static uint32 local_version = 0; /* 每个进程的本地版本号 */
+static uint32_t local_version = 0; /* 每个进程的本地版本号 */
 
 
 /*
@@ -390,18 +395,18 @@ jieba_dict_add_table(PG_FUNCTION_ARGS)
     List *dict_name_list;
     ListCell *lc;
     bool found = false;
-    FILE *conf_file;
-    char conf_path[MAXPGPATH];
-	char *local_data_path_user_dict = NULL;
-	char *data_path_user_dict_copy;
+    char *data_path_user_dict_copy;
+    char *data_path_user_dict_conf_val = NULL;
 
-	// 利用共享内存锁来防止并发操作
-	LWLockAcquire(shared_state->lock, LW_EXCLUSIVE);
-	// ---------------查询用户指定的词典表收集数据---------------
+    // 利用共享内存锁来防止并发操作
+    LWLockAcquire(shared_state->lock, LW_EXCLUSIVE);
+    // ---------------查询用户指定的词典表收集数据---------------
     // 从参数中接收表名
     table_name_text = PG_GETARG_TEXT_PP(0);
     table_name = text_to_cstring(table_name_text);
     quoted_table_name = quote_identifier(table_name);
+    // 读取 jieba.conf 中的配置
+    data_path_user_dict_conf_val = read_data_path_user_dict();
     
     // 连接 SPI
     if (SPI_connect() != SPI_OK_CONNECT)
@@ -421,7 +426,7 @@ jieba_dict_add_table(PG_FUNCTION_ARGS)
     tuptable = SPI_tuptable;
     tupdesc = tuptable->tupdesc;
 
-	// ---------------将查询结果写入 表名.dict 文件---------------
+    // ---------------将查询结果写入 表名.dict 文件---------------
     // 打开 jieba_user.dict 文件
     dict_path = jieba_get_data_path_dict_filename(table_name, DICT_EXT);
     fp = fopen(dict_path, "w");
@@ -429,6 +434,14 @@ jieba_dict_add_table(PG_FUNCTION_ARGS)
     {
         SPI_finish();
         ereport(ERROR, (errcode_for_file_access(), errmsg("pg_jieba: could not open user dictionary file: %m")));
+    }
+
+	// 修改文件权限为 644 (rw-r--r--)
+    if (chmod(dict_path, 0644) != 0)
+    {
+        fclose(fp);
+        SPI_finish();
+        ereport(ERROR, (errcode_for_file_access(), errmsg("pg_jieba: could not set permissions for user dictionary file: %m")));
     }
 
     // 将查询结果写入 表名.dict 文件
@@ -460,169 +473,160 @@ jieba_dict_add_table(PG_FUNCTION_ARGS)
     // 关闭文件和 SPI 连接
     fclose(fp);
     SPI_finish();
-	elog(LOG, "pg_jieba: user dictionary export to %s", dict_path);
-	// ---------------将新词典文件名追加到 pg_jieba.data_path_user_dict 中---------------
-	if (pg_jieba_data_path_user_dict && pg_jieba_data_path_user_dict[0] != '\0')
-	{
-		// 使用 ',' 作为分隔符
-		data_path_user_dict_copy = pstrdup(pg_jieba_data_path_user_dict);
-		if (!SplitIdentifierString(data_path_user_dict_copy, ',', &dict_name_list))
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("pg_jieba: split dict_name_list failed")));
+    elog(LOG, "pg_jieba: user dictionary export to %s", dict_path);
 
-		// 判断列表中是否存在相同的table_name
-		foreach(lc, dict_name_list)
+    // ---------------将新词典文件名追加到 pg_jieba.data_path_user_dict 中---------------
+    if (data_path_user_dict_conf_val && data_path_user_dict_conf_val[0] != '\0')
+    {
+        // 使用 ',' 作为分隔符
+        data_path_user_dict_copy = pstrdup(data_path_user_dict_conf_val);
+        if (!SplitIdentifierString(data_path_user_dict_copy, ',', &dict_name_list))
+            ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("pg_jieba: split dict_name_list failed")));
+
+        // 判断列表中是否存在相同的table_name
+        foreach(lc, dict_name_list)
+        {
+            const char *dict_name = (const char *) lfirst(lc);
+            if (strcmp(dict_name, table_name) == 0)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        // 如果不存在相同的table_name，追加
+        if (!found)
+        {
+            initStringInfo(&buf);
+            appendStringInfo(&buf, "%s,%s", data_path_user_dict_conf_val, table_name);
+            edit_data_path_user_dict(buf.data);
+			if (data_path_user_dict_conf_val)
+            {
+                pfree(data_path_user_dict_conf_val);
+            }
+            data_path_user_dict_conf_val = pstrdup(buf.data);
+            pfree(buf.data);
+        }
+
+        if (dict_name_list) {
+            list_free(dict_name_list);
+        }
+        if (data_path_user_dict_copy) {
+            pfree(data_path_user_dict_copy);
+        }
+    }
+    else
+    {
+        edit_data_path_user_dict(table_name);
+		if (data_path_user_dict_conf_val)
 		{
-			const char *dict_name = (const char *) lfirst(lc);
-			if (strcmp(dict_name, table_name) == 0)
-			{
-				found = true;
-				break;
-			}
-		}
+			pfree(data_path_user_dict_conf_val);
+        }
+        data_path_user_dict_conf_val = pstrdup(table_name);
+    }
 
-		elog(LOG, "pg_jieba: pg_jieba_data_path_user_dict='%s' 111111 found=%d", pg_jieba_data_path_user_dict, found);
-		// 如果不存在相同的table_name，追加
-		if (!found)
-		{
-			initStringInfo(&buf);
-			appendStringInfo(&buf, "%s,%s", pg_jieba_data_path_user_dict, table_name);
-			edit_data_path_user_dict(buf.data);
-			pfree(buf.data);
-		}
-
-		if (dict_name_list) {
-			list_free(dict_name_list);
-		}
-		if (data_path_user_dict_copy) {
-			pfree(data_path_user_dict_copy);
-		}
-	}
-	else
-	{
-		edit_data_path_user_dict(table_name);
-	}
-	// ---------------保存 pg_jieba.data_path_user_dict 到 data_directory 目录下的 jieba.conf 中---------------
-	if (pg_jieba_data_path_user_dict)
-	{
-		snprintf(conf_path, MAXPGPATH, "%s/jieba.conf", DataDir);
-		conf_file = fopen(conf_path, "w");
-		if (conf_file == NULL)
-		{
-			ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("无法打开文件: %s", conf_path)));
-		}
-		fprintf(conf_file, "pg_jieba.data_path_user_dict = '%s'\n", pg_jieba_data_path_user_dict);
-		fclose(conf_file);
-		elog(LOG, "pg_jieba: pg_jieba.data_path_user_dict save to %s", conf_path);
-	}
-
-	// 释放内存
-	if (dict_path)
-	{
-		pfree(dict_path);
-	}
+    // 释放内存
+    if (dict_path)
+    {
+        pfree(dict_path);
+    }
     if (quoted_table_name && quoted_table_name != table_name) {
-		pfree((void *)quoted_table_name);
-	}
-	if (table_name)
-	{
-		pfree(table_name);
-	}
+        pfree((void *)quoted_table_name);
+    }
+    if (table_name)
+    {
+        pfree(table_name);
+    }
 
-	local_data_path_user_dict = pstrdup(pg_jieba_data_path_user_dict);
+    // 释放共享内存锁
+    LWLockRelease(shared_state->lock);
 
-	// 释放共享内存锁
-	LWLockRelease(shared_state->lock);
+    // 重新加载词典
+    jieba_reload_dict_common();
 
-	// 重新加载词典
-	jieba_reload_dict_common();
-
-    PG_RETURN_TEXT_P(cstring_to_text(local_data_path_user_dict));
+    PG_RETURN_TEXT_P(cstring_to_text(data_path_user_dict_conf_val));
 }
 
 Datum
 jieba_dict_remove_table(PG_FUNCTION_ARGS)
 {
-	text *table_name_text;
+    text *table_name_text;
     char *table_name;
-	char conf_path[MAXPGPATH];
-	char* dict_path;
-	List *dict_name_list;
+    List *dict_name_list;
     ListCell *lc;
-	FILE *conf_file;
-	StringInfoData buf;
-	char *local_data_path_user_dict = NULL;
-	char *data_path_user_dict_copy;
-	// 利用共享内存锁来防止并发操作
-	LWLockAcquire(shared_state->lock, LW_EXCLUSIVE);
-	// 从参数中接收表名
+    StringInfoData buf;
+    char *data_path_user_dict_copy;
+    char *data_path_user_dict_conf_val = NULL;
+    char *dict_path;
+
+    // 利用共享内存锁来防止并发操作
+    LWLockAcquire(shared_state->lock, LW_EXCLUSIVE);
+    // 从参数中接收表名
     table_name_text = PG_GETARG_TEXT_PP(0);
     table_name = text_to_cstring(table_name_text);
+    // 读取 jieba.conf 中的配置
+    data_path_user_dict_conf_val = read_data_path_user_dict();
 
-	// 从配置参数 pg_jieba.data_path_user_dict 中移除 table_name
-	if (pg_jieba_data_path_user_dict && pg_jieba_data_path_user_dict[0] != '\0')
-	{
-		// 使用 ',' 作为分隔符
-		data_path_user_dict_copy = pstrdup(pg_jieba_data_path_user_dict);
-		if (!SplitIdentifierString(data_path_user_dict_copy, ',', &dict_name_list))
-			ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("pg_jieba: split dict_name_list failed")));
+    // 从配置参数 pg_jieba.data_path_user_dict 中移除 table_name
+    if (data_path_user_dict_conf_val && data_path_user_dict_conf_val[0] != '\0')
+    {
+        // 使用 ',' 作为分隔符
+        data_path_user_dict_copy = pstrdup(data_path_user_dict_conf_val);
+        if (!SplitIdentifierString(data_path_user_dict_copy, ',', &dict_name_list))
+            ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("pg_jieba: split dict_name_list failed")));
 
-		// 判断列表中是否存在相同的table_name，并移除
-		initStringInfo(&buf);
-		foreach(lc, dict_name_list)
+        // 判断列表中是否存在相同的table_name，并移除
+        initStringInfo(&buf);
+        foreach(lc, dict_name_list)
+        {
+            const char *dict_name = (const char *) lfirst(lc);
+            if (strcmp(dict_name, table_name) != 0) // 只保留不等于table_name的项
+            {
+                if (buf.len > 0)
+                    appendStringInfoString(&buf, ",");
+                appendStringInfoString(&buf, dict_name);
+            }
+        }
+        edit_data_path_user_dict(buf.data);
+		if (data_path_user_dict_conf_val)
 		{
-			const char *dict_name = (const char *) lfirst(lc);
-			if (strcmp(dict_name, table_name) != 0) // 只保留不等于table_name的项
-			{
-				if (buf.len > 0)
-					appendStringInfoString(&buf, ",");
-				appendStringInfoString(&buf, dict_name);
-			}
+			pfree(data_path_user_dict_conf_val);
 		}
-		edit_data_path_user_dict(buf.data);
-		if (buf.data) {
-			pfree(buf.data);
+        data_path_user_dict_conf_val = pstrdup(buf.data);
+        pfree(buf.data);
+        if (dict_name_list) {
+            list_free(dict_name_list);
+        }
+        if (data_path_user_dict_copy) {
+            pfree(data_path_user_dict_copy);
+        }
+    } else {
+        edit_data_path_user_dict("");
+		if (data_path_user_dict_conf_val)
+		{
+			pfree(data_path_user_dict_conf_val);
 		}
-		if (dict_name_list) {
-			list_free(dict_name_list);
-		}
-		if (data_path_user_dict_copy) {
-			pfree(data_path_user_dict_copy);
-		}
-	} else {
-		edit_data_path_user_dict("");
-	}
+        data_path_user_dict_conf_val = pstrdup("");
+    }
 
-	// 覆盖 jieba.conf 中的配置
-	snprintf(conf_path, MAXPGPATH, "%s/jieba.conf", DataDir);
-	conf_file = fopen(conf_path, "w");
-	if (conf_file == NULL)
-	{
-		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("无法打开文件: %s", conf_path)));
-	}
-	fprintf(conf_file, "pg_jieba.data_path_user_dict = '%s'\n", pg_jieba_data_path_user_dict);
-	fclose(conf_file);
-	elog(LOG, "pg_jieba: pg_jieba.data_path_user_dict remove table '%s'", table_name);
+    // 移除字典文件
+    dict_path = jieba_get_data_path_dict_filename(table_name, DICT_EXT);
+    if (access(dict_path, F_OK) == 0) {
+        unlink(dict_path);
+    } else {
+        elog(LOG, "pg_jieba: Dictionary file %s does not exist, don't need to remove.", dict_path);
+    }
+    if (dict_path) {
+        pfree(dict_path);
+    }
+    
+    // 释放共享内存锁
+    LWLockRelease(shared_state->lock);
 
-	// 移除字典文件
-	dict_path = jieba_get_data_path_dict_filename(table_name, DICT_EXT);
-	if (access(dict_path, F_OK) == 0) {
-		unlink(dict_path);
-	} else {
-		elog(LOG, "pg_jieba: Dictionary file %s does not exist, don't need to remove.", dict_path);
-	}
-	if (dict_path) {
-		pfree(dict_path);
-	}
+    // 重新加载词典
+    jieba_reload_dict_common();
 
-	local_data_path_user_dict = pstrdup(pg_jieba_data_path_user_dict);
-	
-	// 释放共享内存锁
-	LWLockRelease(shared_state->lock);
-
-	// 重新加载词典
-	jieba_reload_dict_common();
-
-	PG_RETURN_TEXT_P(cstring_to_text(local_data_path_user_dict));
+    PG_RETURN_TEXT_P(cstring_to_text(data_path_user_dict_conf_val));
 }
 
 static void
@@ -675,7 +679,14 @@ static void
 recompute_dicts_path(void)
 {
 	MemoryContext oldcxt;
-	char	   *user_dicts;
+	char       *base_dicts = NULL;
+	char	   *user_dicts = NULL;
+	char	   *data_path_user_dict = NULL;
+	char       *temp_data_path_user_dict;
+	char       *temp_dict_path;
+	char       *temp_hmm_model_path;
+	char       *temp_base_dicts = NULL;
+	char       *temp_user_dicts = NULL;
 	// char	   *new_dicts;
 
 	JiebaCtx   *new_jieba = NULL;
@@ -686,40 +697,79 @@ recompute_dicts_path(void)
 	if (userDictsValid)
 		return;
 
-	dict_path = jieba_get_tsearch_config_filename(pg_jieba_dict, DICT_EXT);
-	hmm_model_path = jieba_get_tsearch_config_filename(pg_jieba_hmm_model, MODEL_EXT);
-	user_dicts = extract_dict_list(pg_jieba_user_dict);
-	user_dicts = extract_data_path_dict_list(pg_jieba_data_path_user_dict, user_dicts);
-
-	/*。
-	 * Now that we've successfully built the new,
-	 * save it in permanent storage.
-	 */
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	PG_TRY();
 	{
-		// new_dicts = pstrdup(user_dicts);
+		temp_data_path_user_dict = read_data_path_user_dict();
+		if (temp_data_path_user_dict != NULL)
+		{
+			data_path_user_dict = pstrdup(temp_data_path_user_dict);
+			pfree(temp_data_path_user_dict);
+		}
 
-		/*
-		 init will take a few seconds to load dicts.
+		temp_dict_path = jieba_get_tsearch_config_filename(pg_jieba_dict, DICT_EXT);
+		dict_path = pstrdup(temp_dict_path);
+		pfree(temp_dict_path);
+
+		temp_hmm_model_path = jieba_get_tsearch_config_filename(pg_jieba_hmm_model, MODEL_EXT);
+		hmm_model_path = pstrdup(temp_hmm_model_path);
+		pfree(temp_hmm_model_path);
+
+		temp_base_dicts = extract_dict_list(pg_jieba_user_dict);
+		if (temp_base_dicts != NULL)
+		{
+			base_dicts = pstrdup(temp_base_dicts);
+			pfree(temp_base_dicts);
+		}
+
+		temp_user_dicts = extract_data_path_dict_list(data_path_user_dict, base_dicts);
+		if (temp_user_dicts != NULL)
+		{
+			user_dicts = pstrdup(temp_user_dicts);
+			pfree(temp_user_dicts);
+		}
+
+		/*。
+		 * Now that we've successfully built the new,
+		 * save it in permanent storage.
 		 */
-		new_jieba = Jieba_New(dict_path, hmm_model_path, user_dicts);
-	}
-	MemoryContextSwitchTo(oldcxt);
+		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+		{
+			// new_dicts = pstrdup(user_dicts);
 
-	/* Now safe to assign to state variables. */
-	// if (userDicts)
-	// 	pfree(userDicts);
-	// userDicts = new_dicts;
+			/*
+			 init will take a few seconds to load dicts.
+			 */
+			new_jieba = Jieba_New(dict_path, hmm_model_path, user_dicts);
+		}
+		MemoryContextSwitchTo(oldcxt);
 
-	if (jieba) {
-		Jieba_Free(jieba);
-		jieba = NULL;
+		/* Now safe to assign to state variables. */
+		// if (userDicts)
+		// 	pfree(userDicts);
+		// userDicts = new_dicts;
+
+		if (jieba) {
+			Jieba_Free(jieba);
+			jieba = NULL;
+		}
+		jieba = new_jieba;
+		/* Mark the path valid. */
+		userDictsValid = true;
 	}
-	jieba = new_jieba;
-	/* Mark the path valid. */
-	userDictsValid = true;
+	PG_CATCH();
+	{
+		ErrorData *edata;
+		edata = CopyErrorData();
+		elog(LOG, "pg_jieba: Error occurred in recompute_dicts_path: %s", edata->message);
+		FreeErrorData(edata);
+		FlushErrorState();
+	}
+	PG_END_TRY();
 
 	/* Clean up. */
+	if (base_dicts) {
+		pfree(base_dicts);
+	}
 	if (user_dicts) {
 		pfree(user_dicts);
 	}
@@ -912,8 +962,7 @@ extract_data_path_dict_list(const char *dictsString, const char *userDictsString
 	StringInfo buf = &bufdata;
 
 	initStringInfo(&bufdata);
-
-	rawstring = pstrdup(dictsString);
+	rawstring = dictsString ? pstrdup(dictsString) : NULL;
 	user_dicts_rawstring = userDictsString ? pstrdup(userDictsString) : NULL;
 
 	// Parse string into list of identifiers
@@ -921,9 +970,7 @@ extract_data_path_dict_list(const char *dictsString, const char *userDictsString
 		// syntax error in list
 		pfree(rawstring);
 		list_free(elemlist);
-		ereport(LOG,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("parameter must be a list of dictionary")));
+		ereport(LOG,(errcode(ERRCODE_SYNTAX_ERROR),errmsg("parameter must be a list of dictionary")));
 		return NULL;
 	}
 
@@ -932,6 +979,7 @@ extract_data_path_dict_list(const char *dictsString, const char *userDictsString
 		appendStringInfoString(buf, user_dicts_rawstring);
 		first = false;
 	}
+
 	foreach(lc, elemlist)
 	{
 		const char *dict_name = (const char *) lfirst(lc);
@@ -989,33 +1037,15 @@ jieba_get_data_path_dict_filename(const char *basename, const char *extension)
     return result;
 }
 
-
-
 /*
- * 检测并刷新字典
+ * 执行刷新字典
  */
-void check_and_refresh_dictionary(void)
+void jieba_refresh_dictionary(uint32_t global_version)
 {
-    uint32 global_version;
-
-    /* 获取全局版本号 */
-    LWLockAcquire(shared_state->lock, LW_SHARED);
-    global_version = shared_state->global_version;
-    LWLockRelease(shared_state->lock);
-
-    /* 如果版本号更新，刷新字典 */
-    if (global_version != local_version)
-    {
-        elog(LOG, "pg_jieba: Dictionary refresh version from %u to %u, start...", local_version, global_version);
-        userDictsValid = false;
-   		recompute_dicts_path();
-		elog(LOG, "pg_jieba: Dictionary refresh version from %u to %u finished ~", local_version, global_version);
-        local_version = global_version;
-    }
-	else
-	{
-		elog(LOG, "pg_jieba: Dictionary don't need refresh --");
-	}
+	userDictsValid = false;
+	recompute_dicts_path();
+	local_version = global_version;
+	elog(LOG, "pg_jieba: pid = %d, refresh dictionary finished ~", MyProcPid);
 }
 
 /*
@@ -1052,18 +1082,31 @@ static void
 pg_jieba_sighup_handler(SIGNAL_ARGS)
 {
 	ErrorData  *edata;
+	uint32_t   global_version;
+	bool       is_refresh = false;
 
     PG_TRY();
     {
-        if (prev_sighup_handler)
-            prev_sighup_handler(postgres_signal_arg);
+		if (shared_state != NULL)
+		{
+			/* 获取全局版本号 */
+			LWLockAcquire(shared_state->lock, LW_SHARED);
+			global_version = shared_state->global_version;
+			LWLockRelease(shared_state->lock);
 
-        elog(LOG, "pg_jieba: Postmaster received SIGHUP signal !!!");
-        
-        if (shared_state != NULL)
-        {
-            check_and_refresh_dictionary();
-        }
+			/* 如果版本号更新，刷新字典 */
+			if (global_version != local_version)
+			{
+				elog(LOG, "pg_jieba: Postmaster pid = %d, received signal, from version %u to %u ~", MyProcPid, local_version, global_version);
+				jieba_refresh_dictionary(global_version);
+				is_refresh = true;
+			}
+		}
+		/* 隔离pg reload事件和jieba刷新词典事件 */
+		if (!is_refresh && prev_sighup_handler)
+		{
+			prev_sighup_handler(postgres_signal_arg);
+		}
     }
     PG_CATCH();
     {
@@ -1089,17 +1132,49 @@ pg_jieba_sighup_handler(SIGNAL_ARGS)
 static void
 pg_jieba_backend_sighup_handler(SIGNAL_ARGS)
 {
-    /* 首先调用之前的处理函数（如果有的话） */
-    if (prev_sighup_handler_backend)
-        prev_sighup_handler_backend(postgres_signal_arg);
+    ErrorData  *edata;
+	uint32_t   global_version;
+	bool       is_refresh = false;
 
-    elog(LOG, "pg_jieba: Backend received SIGHUP signal !!!");
-    
-    /* 检测并刷新字典 */
-    if (shared_state != NULL)
+    PG_TRY();
+	{
+		if (shared_state != NULL)
+		{
+			/* 获取全局版本号 */
+			LWLockAcquire(shared_state->lock, LW_SHARED);
+			global_version = shared_state->global_version;
+			LWLockRelease(shared_state->lock);
+
+			/* 如果版本号更新，刷新字典 */
+			if (global_version != local_version)
+			{
+				elog(LOG, "pg_jieba: Backend process pid = %d, received signal, from version %u to %u ~", MyProcPid, local_version, global_version);
+				jieba_refresh_dictionary(global_version);
+				is_refresh = true;
+			}
+		}
+		/* 隔离pg reload事件和jieba刷新词典事件 */
+		if (!is_refresh && prev_sighup_handler_backend)
+		{
+			prev_sighup_handler_backend(postgres_signal_arg);
+		}
+	}
+    PG_CATCH();
     {
-        check_and_refresh_dictionary();
+         /* 获取错误信息 */
+        edata = CopyErrorData();
+        
+        /* 记录详细的错误信息 */
+        elog(LOG, "pg_jieba: Error in SIGHUP handler: %s (Error Code: %d, File: %s, Line: %d)", 
+             edata->message,
+             edata->sqlerrcode,
+             edata->filename,
+             edata->lineno);
+             
+        FreeErrorData(edata);
+        FlushErrorState();
     }
+    PG_END_TRY();
 }
 
 /* 
@@ -1112,7 +1187,13 @@ jieba_client_authentication(Port *port, int status)
     /* 登录成功才注册信号处理器 */
     if (status == STATUS_OK)
     {
-        elog(LOG, "pg_jieba: Registering backend SIGHUP handler");
+		/* 初始化 local_version 为当前的全局版本号 */
+        if (shared_state != NULL)
+        {
+            LWLockAcquire(shared_state->lock, LW_SHARED);
+            local_version = shared_state->global_version;
+            LWLockRelease(shared_state->lock);
+        }
         prev_sighup_handler_backend = pqsignal(SIGHUP, pg_jieba_backend_sighup_handler);
     }
 
@@ -1143,10 +1224,11 @@ jieba_reload_dict_common(void)
 	/* 发送 SIGHUP 信号给 Postmaster，用于通知刷新字典 */
     if (kill(PostmasterPid, SIGHUP))
     {
-        ereport(WARNING, (errmsg("pg_jieba: failed to send SIGHUP signal to postmaster: %m")));
-    } else {
-        elog(LOG, "pg_jieba: SIGHUP signal sent to postmaster for reload dictionary");
+		elog(LOG, "pg_jieba: failed to send SIGHUP signal to postmaster: %d", PostmasterPid);
     }
+
+	/* 发送 SIGHUP 信号给 backend process，用于通知刷新字典 */
+	send_sighup_to_all_backends();
 }
 
 /*
@@ -1155,6 +1237,9 @@ jieba_reload_dict_common(void)
 static void
 edit_data_path_user_dict(const char *conf_val)
 {
+	char conf_path[MAXPGPATH];
+	FILE *conf_file;
+
 	set_config_option("pg_jieba.data_path_user_dict",
                      conf_val ? conf_val : "",  // 如果conf_val为NULL，使用空字符串
                      PGC_SIGHUP,
@@ -1164,4 +1249,167 @@ edit_data_path_user_dict(const char *conf_val)
                      0,     // elevel 错误等级
                      false  // is_reload 是否重新加载
                      );
+
+	// 覆盖 jieba.conf 中的配置
+	snprintf(conf_path, MAXPGPATH, "%s/jieba.conf", DataDir);
+	conf_file = fopen(conf_path, "w");
+	if (conf_file == NULL)
+	{
+		ereport(ERROR, (errcode(ERRCODE_IO_ERROR), errmsg("无法打开文件: %s", conf_path)));
+	}
+	fprintf(conf_file, "pg_jieba.data_path_user_dict = '%s'\n", pg_jieba_data_path_user_dict);
+	fclose(conf_file);
+	elog(LOG, "pg_jieba: pg_jieba.data_path_user_dict = '%s'", pg_jieba_data_path_user_dict);
+}
+
+static char*
+read_data_path_user_dict(void)
+{
+    char conf_path[MAXPGPATH];
+    FILE *conf_file;
+    char line[MAXPGPATH];
+    const char *prefix = "pg_jieba.data_path_user_dict";
+    size_t prefix_len;
+    char *conf_val;
+    
+    /* 在函数内分配内存 */
+    conf_val = palloc0(MAXPGPATH);
+    
+    snprintf(conf_path, MAXPGPATH, "%s/jieba.conf", DataDir);
+    conf_file = fopen(conf_path, "r");
+    if (conf_file == NULL)
+        return conf_val;  // 文件不存在时返回空字符串
+    
+    prefix_len = strlen(prefix);
+    
+    /* 逐行读取配置文件 */
+    while (fgets(line, sizeof(line), conf_file) != NULL)
+    {
+        size_t line_len = strlen(line);
+        char *value_start, *value_end;
+        size_t value_len;
+        
+        /* 去除行尾的换行符 */
+        if (line_len > 0 && line[line_len - 1] == '\n')
+            line[--line_len] = '\0';
+            
+        /* 检查前缀 */
+        if (strncmp(line, prefix, prefix_len) != 0)
+            continue;
+            
+        /* 找到等号后的第一个非空白字符 */
+        value_start = line + prefix_len;
+        while (*value_start && (*value_start == ' ' || *value_start == '=' || *value_start == '\t'))
+            value_start++;
+            
+        /* 如果以单引号或双引号开始，则跳过 */
+        if (*value_start == '\'' || *value_start == '"')
+            value_start++;
+            
+        /* 找到值的结束位置 */
+        value_end = line + line_len - 1;
+        /* 如果以单引号或双引号结束，则回退 */
+        if (*value_end == '\'' || *value_end == '"')
+            value_end--;
+        /* 去除尾部空白 */
+        while (value_end > value_start && (*value_end == ' ' || *value_end == '\t'))
+            value_end--;
+            
+        value_len = value_end - value_start + 1;
+        
+        /* 检查缓冲区大小 */
+        if (value_len >= MAXPGPATH)
+        {
+            pfree(conf_val);
+            fclose(conf_file);
+            ereport(ERROR,(errcode(ERRCODE_CONFIG_FILE_ERROR),
+                     errmsg("pg_jieba.data_path_user_dict配置值太长，超过了最大长度限制")));
+        }
+        
+        /* 复制值到输出缓冲区 */
+        memcpy(conf_val, value_start, value_len);
+        conf_val[value_len] = '\0';
+        
+        fclose(conf_file);
+        return conf_val;
+    }
+    
+    fclose(conf_file);
+    return conf_val;
+}
+
+static void send_sighup_to_all_backends(void)
+{
+    int ret;
+    StringInfoData buf;
+    int proc;
+
+    /* 初始化字符串缓冲区，构建 SQL 查询 */
+    initStringInfo(&buf);
+    appendStringInfo(&buf, "SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend'");
+
+    PG_TRY();
+    {
+        /* 连接到 SPI 管理器 */
+        if ((ret = SPI_connect()) != SPI_OK_CONNECT)
+        {
+            ereport(ERROR,(errcode(ERRCODE_INTERNAL_ERROR),errmsg("pg_jieba: SPI_connect failed: %s", 
+                            SPI_result_code_string(ret))));
+        }
+
+        /* 执行查询 */
+        ret = SPI_execute(buf.data, true, 0);
+        if (ret != SPI_OK_SELECT)
+        {
+            ereport(ERROR,(errcode(ERRCODE_INTERNAL_ERROR),errmsg("pg_jieba: SPI_execute failed: %s", 
+                            SPI_result_code_string(ret))));
+        }
+        /* 遍历查询结果，向每个后端进程发送 SIGHUP 信号 */
+        for (proc = 0; proc < SPI_processed; proc++)
+        {
+            HeapTuple   tuple;
+            TupleDesc   tupdesc;
+            bool        isnull;
+            Datum       pid_datum;
+            pid_t       pid;
+
+            /* 获取当前行 */
+            if (SPI_tuptable == NULL || SPI_tuptable->vals == NULL)
+                continue;
+
+            tuple = SPI_tuptable->vals[proc];
+            tupdesc = SPI_tuptable->tupdesc;
+            if (tuple == NULL || tupdesc == NULL)
+                continue;
+
+            /* 获取 pid 列的值 */
+            pid_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+            if (!isnull)
+            {
+                pid = DatumGetInt32(pid_datum);
+                if (pid != 0)
+                {
+                    /* 向进程发送 SIGHUP 信号 */
+                    if (kill(pid, SIGHUP) != 0)
+                    {
+						elog(WARNING, "pg_jieba: failed to send SIGHUP signal to process %d: %m", pid);
+                    }
+                }
+            }
+        }
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata;
+		edata = CopyErrorData();
+		elog(LOG, "pg_jieba: Error while sending SIGHUP to backends: %s", edata->message);
+
+		FreeErrorData(edata);
+		FlushErrorState();
+    }
+    PG_END_TRY();
+
+    /* 正常清理资源 */
+    SPI_finish();
+    pfree(buf.data);
 }
