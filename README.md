@@ -9,6 +9,7 @@ pg_jieba is a PostgreSQL extension for full-text search of Chinese.
 It is a fork of [pg_jieba](https://github.com/jaiminpan/pg_jieba) with some improvements.
 Dictionary reloading no longer requires a restart, just execute `select pg_reload_conf();`.
 Support loading dictionary from table.
+To support loading the dictionary from a table, you need to add `include_if_exists = 'jieba.conf'` to `postgresql.conf`.
 
 
 ## NOTE
