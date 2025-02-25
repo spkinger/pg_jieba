@@ -1042,10 +1042,15 @@ jieba_get_data_path_dict_filename(const char *basename, const char *extension)
  */
 void jieba_refresh_dictionary(uint32_t global_version)
 {
-	userDictsValid = false;
-	recompute_dicts_path();
-	local_version = global_version;
-	elog(LOG, "pg_jieba: pid = %d, refresh dictionary finished ~", MyProcPid);
+	if (shared_state != NULL)
+	{
+		LWLockAcquire(shared_state->lock, LW_EXCLUSIVE);
+		userDictsValid = false;
+		recompute_dicts_path();
+		local_version = global_version;
+		elog(LOG, "pg_jieba: pid = %d, refresh dictionary finished ~", MyProcPid);
+		LWLockRelease(shared_state->lock);
+	}
 }
 
 /*
@@ -1346,7 +1351,7 @@ static void send_sighup_to_all_backends(void)
 
     /* 初始化字符串缓冲区，构建 SQL 查询 */
     initStringInfo(&buf);
-    appendStringInfo(&buf, "SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend'");
+    appendStringInfo(&buf, "SELECT pid FROM pg_stat_activity WHERE backend_type = 'client backend' and client_port > 0 and application_name not like 'citus_internal%%'");
 
     PG_TRY();
     {
